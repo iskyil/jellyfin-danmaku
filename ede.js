@@ -260,6 +260,16 @@
             this.customCorsProxy = window.localStorage.getItem('customCorsProxy') ?? '';
             this.customApiPrefix = window.localStorage.getItem('customApiPrefix') ?? '';
 
+            // 文本屏蔽
+            this.blockedText = normalizeRuleList(safeParseJSON(window.localStorage.getItem('danmakuBlockedText'), []));
+            this.blockedTextSet = new Set();
+            rebuildBlockedTextSet(this);
+
+            // 正则屏蔽
+            this.blockedRegex = normalizeRuleList(safeParseJSON(window.localStorage.getItem('danmakuBlockedRegex'), []));
+            this.blockedRegexEnabled = [];
+            rebuildBlockedRegexCache(this);
+
             this.danmaku = null;
             this.episode_info = null;
             this.obResize = null;
@@ -650,6 +660,286 @@
         });
     }
 
+    function safeParseJSON(value, fallback) {
+        if (value === undefined || value === null || value === '') {
+            return fallback;
+        }
+        try {
+            const parsed = JSON.parse(value);
+            return parsed === undefined || parsed === null ? fallback : parsed;
+        } catch (_e) {
+            return fallback;
+        }
+    }
+
+    function normalizeRuleList(value) {
+        if (!Array.isArray(value)) {
+            return [];
+        }
+        const normalized = [];
+        for (const item of value) {
+            if (!item || typeof item.content !== 'string') continue;
+            const content = item.content.trim();
+            if (!content) continue;
+            normalized.push({
+                content,
+                enabled: !!item.enabled,
+            });
+        }
+        return normalized;
+    }
+
+    function rebuildBlockedTextSet(state) {
+        const ruleList = Array.isArray(state.blockedText) ? state.blockedText : [];
+        const enabledTexts = [];
+        for (const rule of ruleList) {
+            if (!rule || !rule.enabled || typeof rule.content !== 'string') continue;
+            const content = rule.content.trim();
+            if (!content) continue;
+            enabledTexts.push(content);
+        }
+        state.blockedTextSet = new Set(enabledTexts);
+    }
+
+    function getRiskyRegexReason(pattern) {
+        const trimmed = pattern.trim();
+        if (!trimmed) return '正则为空';
+
+        // 为避免灾难回溯，做保守限制（宁可误伤，也不让页面卡死）
+        if (trimmed.length > 200) return '正则过长（>200），可能导致卡顿';
+        if (/\\[1-9]/.test(trimmed)) return '包含反向引用，可能导致卡顿';
+        if (trimmed.includes('(?<=') || trimmed.includes('(?<!')) return '包含后行断言（lookbehind），兼容性较差且可能卡顿';
+
+        // 嵌套量词：(...) 内部有可变长度量词，且分组后还有量词
+        const nestedQuantifier = /\((?:[^()\\]|\\.)*(?:[*+]|\{\d+(?:,\d*)?\})(?:[^()\\]|\\.)*\)(?:[*+]|\{\d+(?:,\d*)?\})/;
+        if (nestedQuantifier.test(trimmed)) return '包含嵌套量词，可能导致灾难回溯卡顿';
+
+        return null;
+    }
+
+    function tryCreateSafeRegex(pattern) {
+        const trimmed = pattern.trim();
+        const riskyReason = getRiskyRegexReason(trimmed);
+        if (riskyReason) {
+            return { ok: false, regex: null, reason: riskyReason };
+        }
+        try {
+            return { ok: true, regex: new RegExp(trimmed), reason: null };
+        } catch (e) {
+            return { ok: false, regex: null, reason: e?.message || '无效正则表达式' };
+        }
+    }
+
+    function rebuildBlockedRegexCache(state) {
+        const ruleList = Array.isArray(state.blockedRegex) ? state.blockedRegex : [];
+        const enabledRegexRules = [];
+        for (const rule of ruleList) {
+            if (!rule || typeof rule.content !== 'string') continue;
+            rule.enabled = !!rule.enabled;
+            rule.regex = null;
+
+            if (!rule.enabled) continue;
+
+            const { ok, regex, reason } = tryCreateSafeRegex(rule.content);
+            if (!ok) {
+                console.error(`[Jellyfin-Danmaku] 屏蔽正则 "${rule.content}" 无效或风险过高：${reason}，已禁用。`);
+                rule.enabled = false;
+                continue;
+            }
+            rule.regex = regex;
+            enabledRegexRules.push(rule);
+        }
+        state.blockedRegexEnabled = enabledRegexRules;
+    }
+
+    function serializeRuleListForStorage(ruleList) {
+        if (!Array.isArray(ruleList)) return [];
+        return ruleList
+            .filter((rule) => rule && typeof rule.content === 'string')
+            .map((rule) => ({ content: rule.content.trim(), enabled: !!rule.enabled }))
+            .filter((rule) => rule.content.length > 0);
+    }
+
+    function scheduleDanmakuRefresh(type = 'reload') {
+        if (!window.ede) return;
+        const debounceMs = 300;
+        if (window.ede._danmakuRefreshTimer) {
+            clearTimeout(window.ede._danmakuRefreshTimer);
+        }
+        window.ede._danmakuRefreshTimer = setTimeout(() => {
+            window.ede._danmakuRefreshTimer = null;
+            refreshDanmakuFromCacheOrReload(type);
+        }, debounceMs);
+    }
+
+    async function refreshDanmakuFromCacheOrReload(type = 'reload') {
+        if (!window.ede) return;
+        if (window.ede.loading) {
+            showDebugInfo('正在重新加载');
+            return;
+        }
+        const hasPlayer = !!document.querySelector(mediaContainerQueryStr) && !!document.querySelector(mediaQueryStr);
+        const cachedComments = window.ede.lastRawComments;
+
+        if (hasPlayer && Array.isArray(cachedComments) && cachedComments.length > 0) {
+            window.ede.loading = true;
+            try {
+                await createDanmaku(cachedComments);
+                showDebugInfo('屏蔽规则已应用');
+            } catch (e) {
+                console.error(e);
+                window.ede.loading = false;
+                reloadDanmaku(type);
+                return;
+            }
+            window.ede.loading = false;
+            const danmakuCtr = document.getElementById('danmakuCtr');
+            if (danmakuCtr && danmakuCtr.style && danmakuCtr.style.opacity !== '1') {
+                danmakuCtr.style.opacity = 1;
+            }
+            return;
+        }
+
+        reloadDanmaku(type);
+    }
+
+    function createBlocklistUI(container) {
+        container.classList.add('blocking-settings');
+        container.innerHTML = `
+            <div class="blocklist-tabs">
+                <button class="blocklist-tab-button active" data-target="text">屏蔽文本</button>
+                <button class="blocklist-tab-button" data-target="regex">屏蔽正则</button>
+            </div>
+            <div id="blocklist-content-text" class="blocklist-content active"></div>
+            <div id="blocklist-content-regex" class="blocklist-content"></div>
+        `;
+
+        const ruleTypes = {
+            text: { title: '文本', placeholder: '添加屏蔽词', list: window.ede.blockedText, key: 'danmakuBlockedText' },
+            regex: { title: '正则', placeholder: '添加正则表达式', list: window.ede.blockedRegex, key: 'danmakuBlockedRegex' },
+        };
+
+        for (const type in ruleTypes) {
+            const config = ruleTypes[type];
+            const contentContainer = container.querySelector(`#blocklist-content-${type}`);
+            renderRuleUI(contentContainer, config.title, config.placeholder, config.list, config.key);
+        }
+
+        container.querySelectorAll('.blocklist-tab-button').forEach((button) => {
+            button.addEventListener('click', () => {
+                container.querySelectorAll('.blocklist-tab-button').forEach((btn) => btn.classList.remove('active'));
+                container.querySelectorAll('.blocklist-content').forEach((content) => content.classList.remove('active'));
+                button.classList.add('active');
+                container.querySelector(`#blocklist-content-${button.dataset.target}`).classList.add('active');
+            });
+        });
+    }
+
+    function renderRuleUI(container, title, placeholder, ruleList, storageKey) {
+        container.innerHTML = `
+            <div class="blocklist-add-rule">
+                <input type="text" class="styledTextInput" placeholder="${placeholder}">
+                <button class="danmakuSidebarSaveButton">添加</button>
+            </div>
+            <div class="blocklist-rules-container"></div>
+        `;
+
+        const input = container.querySelector('input');
+        const addButton = container.querySelector('button');
+        const rulesContainer = container.querySelector('.blocklist-rules-container');
+
+        const saveRules = () => {
+            window.localStorage.setItem(storageKey, JSON.stringify(serializeRuleListForStorage(ruleList)));
+            if (storageKey === 'danmakuBlockedText') {
+                rebuildBlockedTextSet(window.ede);
+            } else if (storageKey === 'danmakuBlockedRegex') {
+                rebuildBlockedRegexCache(window.ede);
+            }
+            scheduleDanmakuRefresh('reload'); // 去抖刷新，避免频繁重载导致卡顿
+        };
+
+        const refreshList = () => {
+            rulesContainer.innerHTML = '';
+            if (ruleList.length === 0) {
+                rulesContainer.innerHTML = '<div class="blocklist-empty">无屏蔽规则</div>';
+            }
+            ruleList.forEach((rule, index) => {
+                const ruleElement = document.createElement('div');
+                ruleElement.className = 'blocklist-rule-item';
+                ruleElement.innerHTML = `
+                    <span class="rule-content"></span>
+                    <div class="rule-actions">
+                        <label class="modernSwitch">
+                            <input type="checkbox" ${rule.enabled ? 'checked' : ''}>
+                            <span class="modernSlider"></span>
+                        </label>
+                        <button class="rule-delete-btn">🗑️</button>
+                    </div>
+                `;
+                ruleElement.querySelector('.rule-content').textContent = rule.content;
+
+                // 切换启用/禁用
+                ruleElement.querySelector('input[type=\"checkbox\"]').addEventListener('change', (e) => {
+                    const isEnabled = e.target.checked;
+                    if (storageKey === 'danmakuBlockedRegex') {
+                        if (isEnabled) {
+                            const { ok, regex, reason } = tryCreateSafeRegex(rule.content);
+                            if (!ok) {
+                                alert(`\"${rule.content}\" 无效或风险过高：${reason}`);
+                                e.target.checked = false;
+                                rule.enabled = false;
+                                rule.regex = null;
+                                saveRules();
+                                return;
+                            }
+                            rule.regex = regex;
+                        } else {
+                            rule.regex = null;
+                        }
+                    }
+                    rule.enabled = isEnabled;
+                    saveRules();
+                });
+
+                // 删除规则
+                ruleElement.querySelector('.rule-delete-btn').addEventListener('click', () => {
+                    ruleList.splice(index, 1);
+                    saveRules();
+                    refreshList();
+                });
+
+                rulesContainer.appendChild(ruleElement);
+            });
+        };
+
+        const addRule = () => {
+            const content = input.value.trim();
+            if (content && !ruleList.some((r) => r.content === content)) {
+                const newRule = { content, enabled: true };
+                if (storageKey === 'danmakuBlockedRegex') {
+                    const { ok, regex, reason } = tryCreateSafeRegex(content);
+                    if (!ok) {
+                        alert(`\"${content}\" 无效或风险过高：${reason}`);
+                        return;
+                    }
+                    newRule.regex = regex;
+                }
+                ruleList.push(newRule);
+                input.value = '';
+                saveRules();
+                refreshList();
+            }
+        };
+
+        addButton.addEventListener('click', addRule);
+        input.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') addRule();
+        });
+        input.addEventListener('keydown', (event) => event.stopPropagation(), true);
+
+        refreshList();
+    }
+
     // 设置弹幕设置内容
     function setupDanmakuSettings(container) {
         function htmlToElement(html) {
@@ -788,6 +1078,21 @@
                     styleSettingItemForContent(item);
                     tabContent.appendChild(item);
                 });
+                if (tab.id === 'filter') {
+                    const separator = document.createElement('hr');
+                    separator.className = 'settings-separator';
+                    tabContent.appendChild(separator);
+
+                    const blockingTitle = document.createElement('div');
+                    blockingTitle.className = 'settings-group-title';
+                    blockingTitle.textContent = '关键词/正则屏蔽';
+                    tabContent.appendChild(blockingTitle);
+
+                    // 创建屏蔽设置的容器并调用UI构建函数
+                    const blockingContainer = document.createElement('div');
+                    createBlocklistUI(blockingContainer);
+                    tabContent.appendChild(blockingContainer);
+                }
             }
 
             container.appendChild(tabContent);
@@ -1783,6 +2088,7 @@
             showDebugInfo('无弹幕');
             return;
         }
+        window.ede.lastRawComments = comments;
 
         let wrapper = document.getElementById('danmakuWrapper');
         wrapper && wrapper.remove();
@@ -2029,7 +2335,31 @@
         const verticalTimeBuckets = {}; // 顶部/底部弹幕计数桶
         const resultComments = [];
 
-        for (const comment of all_cmts) {
+        const blockedTextSet = window.ede.blockedTextSet;
+        const blockedRegexRules = window.ede.blockedRegexEnabled;
+        const hasTextBlock = blockedTextSet && blockedTextSet.size > 0;
+        const hasRegexBlock = Array.isArray(blockedRegexRules) && blockedRegexRules.length > 0;
+
+        commentLoop: for (const comment of all_cmts) {
+            // 弹幕屏蔽（先文本后正则，减少正则执行次数）
+            const commentText = comment.m;
+
+            if (hasTextBlock) {
+                for (const text of blockedTextSet) {
+                    if (commentText.includes(text)) {
+                        continue commentLoop;
+                    }
+                }
+            }
+
+            if (hasRegexBlock) {
+                for (const rule of blockedRegexRules) {
+                    if (rule.regex && rule.regex.test(commentText)) {
+                        continue commentLoop;
+                    }
+                }
+            }
+
             // 去重
             // p format: time,modeId,colorValue,user
             const pWithoutUser = comment.p.substring(0, comment.p.lastIndexOf(','));
@@ -3717,6 +4047,130 @@
             background: rgba(0, 164, 220, 0.08);
             box-shadow: 0 0 0 2px rgba(0, 164, 220, 0.15);
             transform: translateY(-1px);
+        }
+
+        /* 弹幕屏蔽设置UI样式 */
+        .blocking-settings {
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+
+        .blocklist-tabs {
+            display: flex;
+            gap: 8px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+            padding-bottom: 8px;
+        }
+
+        .blocklist-tab-button {
+            padding: 8px 16px !important;
+            border: 1px solid transparent !important;
+            border-radius: 8px !important;
+            background: transparent !important;
+            color: rgba(255, 255, 255, 0.7) !important;
+            cursor: pointer !important;
+            font-size: 14px !important;
+            transition: all 0.3s !important;
+        }
+
+        .blocklist-tab-button:hover {
+            background: rgba(255, 255, 255, 0.1) !important;
+            color: #fff !important;
+        }
+
+        .blocklist-tab-button.active {
+            background: rgba(0, 164, 220, 0.2) !important;
+            border-color: rgba(0, 164, 220, 0.5) !important;
+            color: #fff !important;
+            font-weight: 600;
+        }
+
+        .blocklist-content {
+            display: none;
+            flex-direction: column;
+            gap: 16px;
+        }
+
+        .blocklist-content.active {
+            display: flex;
+        }
+
+        .blocklist-add-rule {
+            display: flex;
+            gap: 10px;
+        }
+        .blocklist-add-rule input {
+            flex-grow: 1;
+        }
+        .blocklist-add-rule button {
+            flex-shrink: 0;
+            padding: 10px 20px !important;
+        }
+
+        .blocklist-rules-container {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            max-height: 40vh;
+            overflow-y: auto;
+            padding-right: 8px;
+        }
+
+        .blocklist-rule-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 12px 16px;
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 8px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .rule-content {
+            color: #eee;
+            word-break: break-all;
+            margin-right: 16px;
+        }
+
+        .rule-actions {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+
+        .rule-delete-btn {
+            background: transparent;
+            border: none;
+            color: #aaa;
+            cursor: pointer;
+            font-size: 18px;
+            transition: color 0.3s;
+        }
+
+        .rule-delete-btn:hover {
+            color: #f44336;
+        }
+
+        .blocklist-empty {
+            color: #888;
+            text-align: center;
+            padding: 20px;
+        }
+
+        .settings-separator {
+            border: none;
+            border-top: 1px solid rgba(255, 255, 255, 0.1);
+            margin: 24px 0;
+        }
+
+        .settings-group-title {
+            color: #fff;
+            font-size: 16px;
+            font-weight: 600;
+            margin-bottom: 16px;
+            padding-bottom: 8px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
         }
 
         
